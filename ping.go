@@ -48,10 +48,10 @@ func (e DestinationUnreachableErr) Error() string {
 }
 
 type pingRequest struct {
-	seq        int
 	resultChan chan PingResult
 	errChan    chan error
 
+	seq   int
 	ttl   int
 	dst   net.Addr
 	start time.Time
@@ -62,18 +62,26 @@ type Pinger struct {
 	seqMu *sync.Mutex
 	seq   int
 
+	id int
+
 	// map of sequence IDs to sent pings
 	sentPingsMu *sync.Mutex // TODO: Potentially swap out for RWMutex
 	sentPings   map[int]pingRequest
 
+	// v4SendChan accepts pingRequests and is read by v4Sender
 	v4SendChan chan pingRequest
 
+	// Logf is called by the library when it wants to log a warning or error.
+	// By default, this produces no output.
 	Logf func(string, ...interface{})
 }
 
 func New() *Pinger {
 	p := &Pinger{
-		seqMu:       &sync.Mutex{},
+		seqMu: &sync.Mutex{},
+
+		id: os.Getpid() & 0xffff,
+
 		sentPingsMu: &sync.Mutex{},
 		sentPings:   map[int]pingRequest{},
 		v4SendChan:  make(chan pingRequest),
@@ -120,7 +128,6 @@ func (p *Pinger) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer v4Conn.Close()
 
 	var wg sync.WaitGroup
 
@@ -135,15 +142,25 @@ func (p *Pinger) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		p.v4Receiver(ctx, v4Conn)
+		p.v4Receiver(v4Conn) // This will exit when the listener closes.
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+		if err := v4Conn.Close(); err != nil {
+			p.Logf("failed to close v4 listener: %s", err)
+		}
 	}()
 
 	wg.Wait()
 	return nil
 }
 
-// v4Sender is the body of the main sending goroutine. There should not be more
-// than one instance of this method running concurrently.
+// v4Sender sends IPv4 ICMP Echos in response to pingRequests placed in the
+// v4SendChan. There should only be one invocation of this method running at
+// one time. It blocks until the context is cancelled.
 func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
 	for {
 		select {
@@ -154,9 +171,9 @@ func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
 				Type: ipv4.ICMPTypeEcho,
 				Code: 0,
 				Body: &icmp.Echo{
-					ID:   os.Getpid() & 0xffff,
+					ID:   id,
 					Seq:  req.seq,
-					Data: []byte("ALLONS Y"),
+					Data: []byte("KNOCK-KNOCK"),
 				},
 			}
 
@@ -180,7 +197,9 @@ func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
 	}
 }
 
-func (p *Pinger) v4Receiver(ctx context.Context, conn *icmp.PacketConn) {
+// v4Receiver reads incoming IPv4 icmp messages from the listener and dispatches
+// them to v4HandleMessageReceived(). It blocks until the listener closes.
+func (p *Pinger) v4Receiver(conn *icmp.PacketConn) {
 	recvBytes := make([]byte, 1500)
 	for {
 		n, peer, err := conn.ReadFrom(recvBytes)
@@ -195,7 +214,7 @@ func (p *Pinger) v4Receiver(ctx context.Context, conn *icmp.PacketConn) {
 	}
 }
 
-func extractSequenceIDFromErrorReply(data []byte) (int, error) {
+func extractSeqFromErrorReply(data []byte) (int, error) {
 	hdr, err := ipv4.ParseHeader(data)
 	if err != nil {
 		return 0, err
@@ -214,6 +233,9 @@ func extractSequenceIDFromErrorReply(data []byte) (int, error) {
 	return echo.Seq, nil
 }
 
+// v4HandleMessageReceived is called to handle each incoming IPv4 ICMP message.
+// It parses the incoming message and then dispatches a result or error to
+// the associated pingRequests channels.
 func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr) {
 	readTime := time.Now()
 
@@ -230,64 +252,88 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 	case ipv4.ICMPTypeDestinationUnreachable:
 		dstUnreach, ok := recvMsg.Body.(*icmp.DstUnreach)
 		if !ok {
-			panic("handle this")
+			p.Logf(
+				"failed to type assert to *icmp.DstUnreach, was %T",
+				recvMsg.Body,
+			)
+			return
 		}
 
-		sequenceID, err := extractSequenceIDFromErrorReply(dstUnreach.Data)
+		seq, err := extractSeqFromErrorReply(dstUnreach.Data)
 		if err != nil {
-			panic("handle this")
+			p.Logf(
+				"failed to extract seq from error reply: %s", err,
+			)
+			return
 		}
 
-		pingRequest, ok := p.getSentPing(sequenceID)
+		pingRequest, ok := p.getSentPing(seq)
 		if !ok {
-			panic("unknown ping sequence id")
+			p.Logf("did not recognise seq: %d", seq)
+			return
 		}
 
+		p.deleteSentPing(seq)
 		pingRequest.errChan <- &DestinationUnreachableErr{
 			Peer:     peer,
 			Duration: readTime.Sub(pingRequest.start),
 		}
-		p.deleteSentPing(sequenceID)
 	case ipv4.ICMPTypeTimeExceeded:
 		timeExceeded, ok := recvMsg.Body.(*icmp.TimeExceeded)
 		if !ok {
-			panic("handle this")
+			p.Logf(
+				"failed to type assert to *icmp.TimeExceeded, was %T",
+				recvMsg.Body,
+			)
+			return
 		}
 
-		sequenceID, err := extractSequenceIDFromErrorReply(
-			timeExceeded.Data,
-		)
+		seq, err := extractSeqFromErrorReply(timeExceeded.Data)
 		if err != nil {
-			panic("handle this")
+			p.Logf(
+				"failed to extract seq from error reply: %s", err,
+			)
+			return
 		}
 
-		pingRequest, ok := p.getSentPing(sequenceID)
+		pingRequest, ok := p.getSentPing(seq)
 		if !ok {
-			panic("unknown ping sequence id")
+			p.Logf("did not recognise seq: %d", seq)
+			return
 		}
 
+		p.deleteSentPing(seq)
 		pingRequest.errChan <- &TimeExceededErr{
 			Peer:     peer,
 			Duration: readTime.Sub(pingRequest.start),
 		}
-		p.deleteSentPing(sequenceID)
 	case ipv4.ICMPTypeEchoReply:
 		echo, ok := recvMsg.Body.(*icmp.Echo)
 		if !ok {
-			panic("handle this")
+			p.Logf(
+				"failed to type assert to *icmp.Echo, was %T",
+				recvMsg.Body,
+			)
+			return
 		}
 
 		// TODO: Check ID is for us :)
 
 		pingRequest, ok := p.getSentPing(echo.Seq)
 		if !ok {
-			panic("unknown ping sequence id")
+			p.Logf("did not recognise seq: %d", echo.Seq)
+			return
 		}
 		p.deleteSentPing(echo.Seq)
 
 		pingRequest.resultChan <- PingResult{
 			Duration: readTime.Sub(pingRequest.start),
 		}
+	default:
+		p.Logf(
+			"unrecognised icmp message (%d:%d) recieved from %s",
+			recvMsg.Type, recvMsg.Code, peer.String(),
+		)
 	}
 }
 
@@ -328,7 +374,7 @@ func (p *Pinger) Ping(ctx context.Context, dst net.Addr, ttl int) (*PingResult, 
 		dst:        dst,
 	}
 
-	// Send ping to ping routine
+	// Send ping to ping sending routine
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -338,6 +384,7 @@ func (p *Pinger) Ping(ctx context.Context, dst net.Addr, ttl int) (*PingResult, 
 	// Wait for response
 	select {
 	case <-ctx.Done():
+		// Prevent the sent ping map leaking if a context deadline is exceeded.
 		p.deleteSentPing(pingReq.seq)
 		return nil, ctx.Err()
 	case res := <-pingReq.resultChan:

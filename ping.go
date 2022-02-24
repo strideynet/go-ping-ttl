@@ -171,7 +171,7 @@ func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
 				Type: ipv4.ICMPTypeEcho,
 				Code: 0,
 				Body: &icmp.Echo{
-					ID:   id,
+					ID:   p.id,
 					Seq:  req.seq,
 					Data: []byte("KNOCK-KNOCK"),
 				},

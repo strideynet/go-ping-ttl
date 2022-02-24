@@ -27,7 +27,7 @@ func main() {
 	}()
 
 	time.Sleep(1 * time.Second)
-	res, err := pinger.Ping(ctx, ip, 12)
+	res, err := pinger.Ping(ctx, ip, 2)
 	if err != nil {
 		panic(err)
 	}

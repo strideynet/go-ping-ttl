@@ -27,7 +27,11 @@ type TimeExceededErr struct {
 }
 
 func (e TimeExceededErr) Error() string {
-	return fmt.Sprintf("received time exceeded from peer (%s)", e.Peer.String())
+	return fmt.Sprintf(
+		"received time exceeded from peer (%s) (%s)",
+		e.Peer.String(),
+		e.Duration.String(),
+	)
 }
 
 type DestinationUnreachableErr struct {
@@ -36,10 +40,15 @@ type DestinationUnreachableErr struct {
 }
 
 func (e DestinationUnreachableErr) Error() string {
-	return fmt.Sprintf("received destination unreachable from peer (%s)", e.Peer.String())
+	return fmt.Sprintf(
+		"received destination unreachable from peer (%s) (%s)",
+		e.Peer.String(),
+		e.Duration.String(),
+	)
 }
 
 type pingRequest struct {
+	seq        int
 	resultChan chan PingResult
 	errChan    chan error
 
@@ -49,6 +58,10 @@ type pingRequest struct {
 }
 
 type Pinger struct {
+	// incrementing sequence count ID for referring to sent pings
+	seqMu *sync.Mutex
+	seq   int
+
 	// map of sequence IDs to sent pings
 	sentPingsMu *sync.Mutex // TODO: Potentially swap out for RWMutex
 	sentPings   map[int]pingRequest
@@ -60,6 +73,7 @@ type Pinger struct {
 
 func New() *Pinger {
 	p := &Pinger{
+		seqMu:       &sync.Mutex{},
 		sentPingsMu: &sync.Mutex{},
 		sentPings:   map[int]pingRequest{},
 		v4SendChan:  make(chan pingRequest),
@@ -67,6 +81,16 @@ func New() *Pinger {
 	}
 
 	return p
+}
+
+func (p *Pinger) getSeq() int {
+	p.seqMu.Lock()
+	defer p.seqMu.Unlock()
+
+	seq := p.seq
+	p.seq++
+
+	return seq
 }
 
 func (p *Pinger) getSentPing(seq int) (pingRequest, bool) {
@@ -84,11 +108,11 @@ func (p *Pinger) deleteSentPing(seq int) {
 	delete(p.sentPings, seq)
 }
 
-func (p *Pinger) setSentPing(seq int, ping pingRequest) {
+func (p *Pinger) addSentPing(req pingRequest) {
 	p.sentPingsMu.Lock()
 	defer p.sentPingsMu.Unlock()
 
-	p.sentPings[seq] = ping
+	p.sentPings[req.seq] = req
 }
 
 func (p *Pinger) Run(ctx context.Context) error {
@@ -121,21 +145,17 @@ func (p *Pinger) Run(ctx context.Context) error {
 // v4Sender is the body of the main sending goroutine. There should not be more
 // than one instance of this method running concurrently.
 func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
-	// Keep track of sent packet count so we can assign each a unique identifier
-	sequence := 0
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case req := <-p.v4SendChan:
-			sequence += 1
 			msg := icmp.Message{
 				Type: ipv4.ICMPTypeEcho,
 				Code: 0,
 				Body: &icmp.Echo{
 					ID:   os.Getpid() & 0xffff,
-					Seq:  sequence,
+					Seq:  req.seq,
 					Data: []byte("ALLONS Y"),
 				},
 			}
@@ -148,12 +168,12 @@ func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
 
 			req.start = time.Now()
 
-			p.setSentPing(sequence, req)
+			p.addSentPing(req)
 			if err := writeWithTTL(
 				conn, req.ttl, req.dst, writeBytes,
 			); err != nil {
 				req.errChan <- err
-				p.deleteSentPing(sequence)
+				p.deleteSentPing(req.seq)
 				continue
 			}
 		}
@@ -301,6 +321,7 @@ func (p *Pinger) Ping(ctx context.Context, dst net.Addr, ttl int) (*PingResult, 
 	}
 
 	pingReq := pingRequest{
+		seq:        p.getSeq(),
 		resultChan: make(chan PingResult),
 		errChan:    make(chan error),
 		ttl:        ttl,
@@ -317,6 +338,7 @@ func (p *Pinger) Ping(ctx context.Context, dst net.Addr, ttl int) (*PingResult, 
 	// Wait for response
 	select {
 	case <-ctx.Done():
+		p.deleteSentPing(pingReq.seq)
 		return nil, ctx.Err()
 	case res := <-pingReq.resultChan:
 		return &res, nil

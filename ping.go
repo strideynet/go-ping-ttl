@@ -62,6 +62,8 @@ type Pinger struct {
 	seqMu *sync.Mutex
 	seq   int
 
+	// id is used to mark messages as coming from a particular process. This
+	// allows us to filter out returning messages intended for another process.
 	id int
 
 	// map of sequence IDs to sent pings
@@ -91,6 +93,8 @@ func New() *Pinger {
 	return p
 }
 
+// getSeq returns an incrementing counter that we use to pair up echo requests
+// and responses.
 func (p *Pinger) getSeq() int {
 	p.seqMu.Lock()
 	defer p.seqMu.Unlock()
@@ -128,6 +132,10 @@ func (p *Pinger) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	v6Conn, err := icmp.ListenPacket("ipv6:icmp", "0.0.0.0")
+	if err != nil {
+		return err
+	}
 
 	var wg sync.WaitGroup
 
@@ -150,6 +158,9 @@ func (p *Pinger) Run(ctx context.Context) error {
 		defer wg.Done()
 		<-ctx.Done()
 		if err := v4Conn.Close(); err != nil {
+			p.Logf("failed to close v4 listener: %s", err)
+		}
+		if err := v6Conn.Close(); err != nil {
 			p.Logf("failed to close v4 listener: %s", err)
 		}
 	}()
@@ -317,7 +328,10 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 			return
 		}
 
-		// TODO: Check ID is for us :)
+		if echo.ID != p.id {
+			p.Logf("message has alien ID (%d), ignoring", echo.ID)
+			return
+		}
 
 		pingRequest, ok := p.getSentPing(echo.Seq)
 		if !ok {

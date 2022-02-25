@@ -27,10 +27,14 @@ func main() {
 	}()
 
 	time.Sleep(1 * time.Second)
-	res, err := pinger.Ping(ctx, ip, 2)
-	if err != nil {
-		panic(err)
-	}
 
-	log.Printf("%+v", res)
+	for i := 1; i < 31; i++ {
+		res, err := pinger.Ping(ctx, ip, i)
+		if err == nil {
+			log.Printf("%+v", res)
+			break
+		} else {
+			log.Printf("%s", err)
+		}
+	}
 }

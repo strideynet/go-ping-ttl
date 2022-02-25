@@ -188,9 +188,9 @@ func (p *Pinger) Run(ctx context.Context) error {
 	return nil
 }
 
-// v4Sender sends IPv4 ICMP Echos in response to pingRequests placed in the
-// v4SendChan. There should only be one invocation of this method running at
-// one time. It blocks until the context is cancelled.
+// sender sends  ICMP Echos in response to pingRequests placed in the reqChan.
+// There should only be one invocation of this method for a given channel at one
+// time. It blocks until the context is cancelled.
 func (p *Pinger) sender(ctx context.Context, conn *icmp.PacketConn, msgType icmp.Type, reqChan <-chan pingRequest) {
 	for {
 		select {
@@ -240,7 +240,7 @@ func (p *Pinger) receiver(conn *icmp.PacketConn, proto Proto) {
 			panic(err)
 		}
 
-		p.v4HandleMessageReceived(recvBytes, n, peer, proto)
+		p.handleMessageReceived(recvBytes, n, peer, proto)
 	}
 }
 
@@ -274,10 +274,10 @@ func extractSeqFromErrorReply(data []byte, proto Proto) (int, error) {
 	return echo.Seq, nil
 }
 
-// v4HandleMessageReceived is called to handle each incoming IPv4 ICMP message.
+// handleMessageReceived is called to handle each incoming IPv4 ICMP message.
 // It parses the incoming message and then dispatches a result or error to
 // the associated pingRequests channels.
-func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr, proto Proto) {
+func (p *Pinger) handleMessageReceived(recvBytes []byte, n int, peer net.Addr, proto Proto) {
 	readTime := time.Now()
 
 	recvMsg, err := icmp.ParseMessage(int(proto), recvBytes[:n])

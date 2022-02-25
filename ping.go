@@ -11,6 +11,14 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+)
+
+type Proto int
+
+var (
+	ProtoICMPv4 Proto = 1
+	ProtoICMPv6 Proto = 58
 )
 
 // References:
@@ -70,8 +78,10 @@ type Pinger struct {
 	sentPingsMu *sync.Mutex // TODO: Potentially swap out for RWMutex
 	sentPings   map[int]pingRequest
 
-	// v4SendChan accepts pingRequests and is read by v4Sender
+	// v4SendChan accepts PingRequests and sends them via IPv4 ICMP
 	v4SendChan chan pingRequest
+	// v6SendChan accepts PingRequests and sends them via IPv6 ICMP
+	v6SendChan chan pingRequest
 
 	// Logf is called by the library when it wants to log a warning or error.
 	// By default, this produces no output.
@@ -87,6 +97,7 @@ func New() *Pinger {
 		sentPingsMu: &sync.Mutex{},
 		sentPings:   map[int]pingRequest{},
 		v4SendChan:  make(chan pingRequest),
+		v6SendChan:  make(chan pingRequest),
 		Logf:        func(s string, i ...interface{}) {},
 	}
 
@@ -132,7 +143,7 @@ func (p *Pinger) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	v6Conn, err := icmp.ListenPacket("ipv6:icmp", "0.0.0.0")
+	v6Conn, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
 	if err != nil {
 		return err
 	}
@@ -143,26 +154,34 @@ func (p *Pinger) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		p.v4Sender(ctx, v4Conn)
+		p.sender(ctx, v4Conn, ipv4.ICMPTypeEcho, p.v4SendChan)
+		if err := v4Conn.Close(); err != nil {
+			p.Logf("failed to close v4 listener: %s", err)
+		}
+	}()
+
+	// V6 Sender
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		p.sender(ctx, v6Conn, ipv6.ICMPTypeEchoRequest, p.v6SendChan)
+		if err := v6Conn.Close(); err != nil {
+			p.Logf("failed to close v6 listener: %s", err)
+		}
 	}()
 
 	// V4 Reciever
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		p.v4Receiver(v4Conn) // This will exit when the listener closes.
+		p.receiver(v4Conn, ProtoICMPv4) // This will exit when the listener closes.
 	}()
 
+	// V6 Reciever
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-ctx.Done()
-		if err := v4Conn.Close(); err != nil {
-			p.Logf("failed to close v4 listener: %s", err)
-		}
-		if err := v6Conn.Close(); err != nil {
-			p.Logf("failed to close v4 listener: %s", err)
-		}
+		p.receiver(v6Conn, ProtoICMPv6) // This will exit when the listener closes.
 	}()
 
 	wg.Wait()
@@ -172,14 +191,14 @@ func (p *Pinger) Run(ctx context.Context) error {
 // v4Sender sends IPv4 ICMP Echos in response to pingRequests placed in the
 // v4SendChan. There should only be one invocation of this method running at
 // one time. It blocks until the context is cancelled.
-func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
+func (p *Pinger) sender(ctx context.Context, conn *icmp.PacketConn, msgType icmp.Type, reqChan <-chan pingRequest) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case req := <-p.v4SendChan:
+		case req := <-reqChan:
 			msg := icmp.Message{
-				Type: ipv4.ICMPTypeEcho,
+				Type: msgType,
 				Code: 0,
 				Body: &icmp.Echo{
 					ID:   p.id,
@@ -208,9 +227,9 @@ func (p *Pinger) v4Sender(ctx context.Context, conn *icmp.PacketConn) {
 	}
 }
 
-// v4Receiver reads incoming IPv4 icmp messages from the listener and dispatches
+// receiver reads incoming IPv4 icmp messages from the listener and dispatches
 // them to v4HandleMessageReceived(). It blocks until the listener closes.
-func (p *Pinger) v4Receiver(conn *icmp.PacketConn) {
+func (p *Pinger) receiver(conn *icmp.PacketConn, proto Proto) {
 	recvBytes := make([]byte, 1500)
 	for {
 		n, peer, err := conn.ReadFrom(recvBytes)
@@ -221,17 +240,28 @@ func (p *Pinger) v4Receiver(conn *icmp.PacketConn) {
 			panic(err)
 		}
 
-		p.v4HandleMessageReceived(recvBytes, n, peer)
+		p.v4HandleMessageReceived(recvBytes, n, peer, proto)
 	}
 }
 
-func extractSeqFromErrorReply(data []byte) (int, error) {
-	hdr, err := ipv4.ParseHeader(data)
-	if err != nil {
-		return 0, err
+func extractSeqFromErrorReply(data []byte, proto Proto) (int, error) {
+	hdrLen := 0
+	if proto == ProtoICMPv4 {
+		hdr, err := ipv4.ParseHeader(data)
+		if err != nil {
+			return 0, err
+		}
+		hdrLen = hdr.Len
+	} else {
+		// Ensure IPv6 header is valid, even if we know the length is fixed.
+		_, err := ipv6.ParseHeader(data)
+		if err != nil {
+			return 0, err
+		}
+		hdrLen = ipv6.HeaderLen
 	}
 
-	msg, err := icmp.ParseMessage(1, data[hdr.Len:])
+	msg, err := icmp.ParseMessage(int(proto), data[hdrLen:])
 	if err != nil {
 		return 0, err
 	}
@@ -247,10 +277,10 @@ func extractSeqFromErrorReply(data []byte) (int, error) {
 // v4HandleMessageReceived is called to handle each incoming IPv4 ICMP message.
 // It parses the incoming message and then dispatches a result or error to
 // the associated pingRequests channels.
-func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr) {
+func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr, proto Proto) {
 	readTime := time.Now()
 
-	recvMsg, err := icmp.ParseMessage(1, recvBytes[:n])
+	recvMsg, err := icmp.ParseMessage(int(proto), recvBytes[:n])
 	if err != nil {
 		p.Logf(
 			"failed to parse icmp message from '%s': %s",
@@ -260,7 +290,7 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 	}
 
 	switch recvMsg.Type {
-	case ipv4.ICMPTypeDestinationUnreachable:
+	case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
 		dstUnreach, ok := recvMsg.Body.(*icmp.DstUnreach)
 		if !ok {
 			p.Logf(
@@ -270,7 +300,7 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 			return
 		}
 
-		seq, err := extractSeqFromErrorReply(dstUnreach.Data)
+		seq, err := extractSeqFromErrorReply(dstUnreach.Data, proto)
 		if err != nil {
 			p.Logf(
 				"failed to extract seq from error reply: %s", err,
@@ -289,7 +319,7 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 			Peer:     peer,
 			Duration: readTime.Sub(pingRequest.start),
 		}
-	case ipv4.ICMPTypeTimeExceeded:
+	case ipv4.ICMPTypeTimeExceeded, ipv6.ICMPTypeTimeExceeded:
 		timeExceeded, ok := recvMsg.Body.(*icmp.TimeExceeded)
 		if !ok {
 			p.Logf(
@@ -299,7 +329,7 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 			return
 		}
 
-		seq, err := extractSeqFromErrorReply(timeExceeded.Data)
+		seq, err := extractSeqFromErrorReply(timeExceeded.Data, proto)
 		if err != nil {
 			p.Logf(
 				"failed to extract seq from error reply: %s", err,
@@ -318,7 +348,7 @@ func (p *Pinger) v4HandleMessageReceived(recvBytes []byte, n int, peer net.Addr)
 			Peer:     peer,
 			Duration: readTime.Sub(pingRequest.start),
 		}
-	case ipv4.ICMPTypeEchoReply:
+	case ipv4.ICMPTypeEchoReply, ipv6.ICMPTypeEchoReply:
 		echo, ok := recvMsg.Body.(*icmp.Echo)
 		if !ok {
 			p.Logf(
@@ -375,7 +405,7 @@ func writeWithTTL(c *icmp.PacketConn, ttl int, dst net.Addr, b []byte) error {
 	return nil
 }
 
-func (p *Pinger) Ping(ctx context.Context, dst net.Addr, ttl int) (*PingResult, error) {
+func (p *Pinger) Ping(ctx context.Context, dst *net.IPAddr, ttl int) (*PingResult, error) {
 	if ttl == 0 {
 		ttl = 64
 	}
@@ -388,14 +418,21 @@ func (p *Pinger) Ping(ctx context.Context, dst net.Addr, ttl int) (*PingResult, 
 		dst:        dst,
 	}
 
-	// Send ping to ping sending routine
+	var sendChan chan<- pingRequest
+	if dst.IP.To4() != nil {
+		sendChan = p.v4SendChan
+	} else {
+		sendChan = p.v6SendChan
+	}
+
+	// Send ping request to pinger through channel
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case p.v4SendChan <- pingReq:
+	case sendChan <- pingReq:
 	}
 
-	// Wait for response
+	// Wait for success or error response
 	select {
 	case <-ctx.Done():
 		// Prevent the sent ping map leaking if a context deadline is exceeded.

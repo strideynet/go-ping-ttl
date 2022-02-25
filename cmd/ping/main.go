@@ -13,7 +13,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ip, err := net.ResolveIPAddr("ip4", "google.com")
+	// ip, err := net.ResolveIPAddr("ip4", "google.com")
+	ip, err := net.ResolveIPAddr("ip6", "2001:4860:4860::8888")
 	if err != nil {
 		panic(err)
 	}

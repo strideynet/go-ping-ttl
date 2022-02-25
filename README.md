@@ -40,7 +40,7 @@ alt="GitHub issues">
 2. Call `.Ping()` with a context and the address of the host you want to ping.
     a. Ping timeouts are driven by context, so if you want the ping to timeout, use `context.WithTimeout()` or similar.
 
-```
+```go
 pinger := pingttl.New()
 
 ip, err := net.ResolveIPAddr("ip4", "google.com")

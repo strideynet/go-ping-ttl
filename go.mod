@@ -1,4 +1,4 @@
-module github.com/stridey/go-ping-ttl
+module github.com/strideynet/go-ping-ttl
 
 go 1.17
 

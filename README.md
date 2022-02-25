@@ -36,9 +36,9 @@ alt="GitHub issues">
 ## Usage
 
 1. Create an instance of the Pinger with `pingttl.New()`
-    a. You want to have one of these for the entirey of your application. Inject it like you would other dependencies, or store it globally (🤢).
 2. Call `.Ping()` with a context and the address of the host you want to ping.
-    a. Ping timeouts are driven by context, so if you want the ping to timeout, use `context.WithTimeout()` or similar.
+
+**Your entire application should have a single instance of Pinger. Store it globally (🤢), or preferably, inject it as a dependency!** 
 
 ```go
 pinger := pingttl.New()

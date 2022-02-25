@@ -51,7 +51,8 @@ if err != nil {
 ctx, cancel := context.WithTimeout(context.Background(), time.Second * 5)
 defer cancel()
 
-res, err := pinger.Ping(ctx, ip)
+// Providing 0 as a TTL will default to a sane value (64)
+res, err := pinger.Ping(ctx, ip, 0)
 if err != nil {
     return err
 }

@@ -6,15 +6,15 @@ import (
 	"net"
 	"time"
 
-	pingttl "github.com/stridey/go-ping-ttl"
+	pingttl "github.com/strideynet/go-ping-ttl"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ip, err := net.ResolveIPAddr("ip4", "google.com")
-	ip, err := net.ResolveIPAddr("ip6", "2001:4860:4860::8888")
+	ip, err := net.ResolveIPAddr("ip4", "8.8.8.8")
+	// ip, err := net.ResolveIPAddr("ip6", "2001:4860:4860::8888")
 	if err != nil {
 		panic(err)
 	}
